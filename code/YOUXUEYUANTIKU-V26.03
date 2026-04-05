@@ -1,0 +1,596 @@
+import re
+import html
+import os
+import json
+import sys
+import time
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+
+
+def clean_html(text):
+    """清理HTML标签和实体"""
+    if not text:
+        return ""
+    text = html.unescape(text)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = text.replace('&ensp;', ' ').replace('&nbsp;', ' ')
+    text = ' '.join(text.split())
+    return text.strip()
+
+
+def extract_question_text(block):
+    """提取题干文本"""
+    # 方法1：查找rich-text中的内容
+    question_match = re.search(r'<div[^>]*class="rich-text"[^>]*>(.*?)</div>', block, re.DOTALL)
+    if question_match:
+        raw_question = question_match.group(1)
+        question_text = clean_html(raw_question)
+
+        # 移除空白和特殊字符
+        question_text = re.sub(r'\s+', ' ', question_text)
+
+        # 如果是填空题，将[1][2]等替换为____
+        question_text = re.sub(r'\[(\d+)\]', '____', question_text)
+
+        return question_text.strip()
+
+    # 方法2：尝试其他常见模式
+    pattern2 = r'<span[^>]*class="[^"]*content[^"]*"[^>]*>(.*?)</span>'
+    match2 = re.search(pattern2, block, re.DOTALL)
+    if match2:
+        text = clean_html(match2.group(1))
+        text = re.sub(r'\[(\d+)\]', '____', text)
+        return text.strip()
+
+    return ""
+
+
+def detect_question_type(block):
+    """检测题目类型"""
+    if 'completion-question' in block or 'blank-question' in block:
+        return 'completion'
+    if 'true-or-false-question' in block:
+        return 'judge'
+    if 'ul-checkbox' in block or 'checkbox' in block.lower():
+        return 'multi'
+    if 'ul-radio' in block or 'radio' in block.lower():
+        return 'single'
+    return 'single'
+
+
+def extract_correct_answer(block, question_type):
+    """提取正确答案字母"""
+    correct_answer = ""
+
+    if question_type == 'completion':
+        return 'A'  # 填空题默认返回A
+
+    elif question_type == 'judge':
+        answer_section = re.search(r'正确答案[：:].*?(icon-zhengque1|icon-cuowu1)', block, re.DOTALL | re.IGNORECASE)
+        if answer_section:
+            icon_class = answer_section.group(1)
+            if 'icon-zhengque1' in icon_class:
+                correct_answer = 'A'
+            elif 'icon-cuowu1' in icon_class:
+                correct_answer = 'B'
+        else:
+            if 'icon-zhengque1' in block:
+                correct_answer = 'A'
+            elif 'icon-cuowu1' in block:
+                correct_answer = 'B'
+
+    else:
+        answer_pattern1 = r'>正确答案：.*?<span[^>]*>([A-D]+)</span>'
+        match1 = re.search(answer_pattern1, block, re.DOTALL | re.IGNORECASE)
+        if match1:
+            correct_answer = match1.group(1)
+        else:
+            answer_pattern2 = r'正确答案[：:]\s*([A-D]+)'
+            match2 = re.search(answer_pattern2, block, re.IGNORECASE)
+            if match2:
+                correct_answer = match2.group(1)
+            else:
+                answer_pattern3 = r'<span[^>]*>([A-D]{2,})</span>'
+                match3 = re.search(answer_pattern3, block, re.DOTALL | re.IGNORECASE)
+                if match3:
+                    correct_answer = match3.group(1)
+                elif question_type == 'single':
+                    error_match = re.search(r'class="[^"]*error[^"]*"[^>]*>.*?value="([A-D])"', block, re.DOTALL)
+                    if error_match:
+                        correct_answer = error_match.group(1)
+
+    return correct_answer
+
+
+def extract_all_completion_answers(block):
+    """提取填空题所有答案"""
+    answers = []
+
+    # 方法1：查找 <div>[数字] <span>答案</span></div> 格式
+    pattern1 = r'<div[^>]*>?\s*\[(\d+)\]\s*<span[^>]*>(.*?)</span>\s*</div>'
+    matches1 = re.findall(pattern1, block, re.DOTALL | re.IGNORECASE)
+    for num, answer in matches1:
+        clean_answer = clean_html(answer).strip()
+        if clean_answer:
+            answers.append((num, clean_answer))
+
+    # 方法2：查找"正确答案："后面的文本
+    if not answers:
+        answer_section = re.search(r'正确答案[：:](.*?)(?:<div|</div>|$)', block, re.DOTALL | re.IGNORECASE)
+        if answer_section:
+            answer_text = answer_section.group(1)
+            pattern2 = r'\[(\d+)\]\s*([^\[\]\n]+)'
+            matches2 = re.findall(pattern2, answer_text, re.DOTALL)
+            for num, answer in matches2:
+                clean_answer = clean_html(answer).strip()
+                if clean_answer:
+                    answers.append((num, clean_answer))
+
+    # 方法3：查找多个答案段落
+    if not answers:
+        answer_divs = re.findall(r'<div[^>]*>\s*\[(\d+)\]\s*([^<]+)', block, re.DOTALL | re.IGNORECASE)
+        for num, answer in answer_divs:
+            clean_answer = clean_html(answer).strip()
+            if clean_answer:
+                answers.append((num, clean_answer))
+
+    # 按数字排序
+    answers.sort(key=lambda x: int(x[0]))
+
+    return answers
+
+
+def extract_choices(block):
+    """提取选择题选项"""
+    choices = []
+
+    # 方法1：查找标准格式的选项
+    choice_patterns = [
+        r'<span[^>]*class="index"[^>]*>(.*?)</span>.*?<span[^>]*class="rich-text"[^>]*>(.*?)</span>',
+        r'class="index"[^>]*>\s*([A-D])\.?\s*<.*?class="rich-text"[^>]*>(.*?)<',
+        r'<li[^>]*>\s*([A-D])\.\s*(.*?)\s*</li>',
+        r'<span[^>]*>\s*([A-D])\.\s*</span>\s*<span[^>]*>(.*?)</span>'
+    ]
+
+    for pattern in choice_patterns:
+        choice_matches = re.findall(pattern, block, re.DOTALL)
+        if choice_matches:
+            for index, text in choice_matches:
+                clean_index = clean_html(index).replace('.', '').strip()
+                clean_text = clean_html(text).strip()
+                if clean_index and clean_text:
+                    if not any(idx == clean_index for idx, _ in choices):
+                        choices.append((clean_index, clean_text))
+            if choices:
+                break
+
+    # 方法2：如果没找到，尝试直接查找选项内容
+    if not choices:
+        option_pattern = r'>([A-D])\.\s*([^<]+)<'
+        option_matches = re.findall(option_pattern, block, re.DOTALL)
+        for index, text in option_matches:
+            clean_text = clean_html(text).strip()
+            if clean_text:
+                choices.append((index, clean_text))
+
+    # 按A,B,C,D顺序排序
+    choices.sort(key=lambda x: x[0])
+
+    return choices
+
+
+def extract_questions(html_content):
+    """主提取函数 - 返回文本格式和JSON格式"""
+    text_results = []
+    json_list = []
+
+    # 查找所有题目块
+    question_blocks = []
+
+    # 方法1：查找question-item
+    pattern1 = r'<div[^>]*class="question-item"[^>]*>(.*?)</div>\s*</div>\s*</div>'
+    question_blocks = re.findall(pattern1, html_content, re.DOTALL)
+
+    # 方法2：如果没找到，尝试其他模式
+    if not question_blocks:
+        question_blocks = re.split(r'<div[^>]*class="[^"]*question[^"]*"[^>]*>', html_content)[1:]
+
+    if not question_blocks:
+        print("[ERROR] 未找到题目块，请检查HTML格式")
+        return "", []
+
+    print(f"[OK] 找到 {len(question_blocks)} 个题目块")
+
+    for i, block in enumerate(question_blocks, 1):
+        # 提取题干
+        question_text = extract_question_text(block)
+        if not question_text:
+            question_text = f"题目{i}"
+
+        # 检测题目类型
+        question_type = detect_question_type(block)
+
+        # 提取正确答案
+        correct_answer_key = extract_correct_answer(block, question_type)
+
+        if question_type == 'completion':
+            # 填空题处理 - 提取所有答案
+            all_answers = extract_all_completion_answers(block)
+
+            # 合并所有答案，用逗号隔开
+            if all_answers:
+                merged_answers = []
+                for _, answer in all_answers:
+                    merged_answers.append(answer)
+                merged_answer_text = '，'.join(merged_answers)  # 使用中文逗号
+            else:
+                merged_answer_text = "______"
+
+            # 生成文本格式
+            formatted_question = f"{i}.{question_text}...({correct_answer_key})"
+            text_results.append(formatted_question)
+
+            # 添加A选项（合并的答案）
+            text_results.append(f"{correct_answer_key}.{merged_answer_text}")
+            # 添加B选项（——）
+            text_results.append(f"B.——")
+
+            # 构建正确答案文本（带编号）
+            if all_answers:
+                answer_texts = []
+                for idx, (num, answer) in enumerate(all_answers, 1):
+                    answer_texts.append(f"{idx}.{answer}")
+                correct_text = '，'.join(answer_texts)  # 使用中文逗号
+            else:
+                correct_text = '______'
+
+            text_results.append(f"\n正确答案：{correct_text}\n")
+
+            # 生成JSON格式 - 填空题合并所有答案为一个字符串
+            json_options = []
+            if all_answers:
+                answer_list = [answer for _, answer in all_answers]
+                merged_json_answer = '，'.join(answer_list)  # 使用中文逗号
+                json_options.append(merged_json_answer)
+            else:
+                json_options.append("______")
+
+            json_list.append({
+                'q': question_text,
+                'a': json_options,
+                'ans': correct_answer_key
+            })
+
+        elif question_type == 'judge':
+            # 判断题处理
+            answer_letter = correct_answer_key if correct_answer_key in ['A', 'B'] else 'B'
+
+            # 生成文本格式
+            formatted_question = f"{i}.{question_text}...({answer_letter})"
+            text_results.append(formatted_question)
+            text_results.append("A.正确")
+            text_results.append("B.错误")
+            text_results.append(f"\n正确答案：{'正确' if answer_letter == 'A' else '错误'}\n")
+
+            # 生成JSON格式
+            json_options = ["正确", "错误"]
+            json_list.append({
+                'q': question_text,
+                'a': json_options,
+                'ans': answer_letter
+            })
+
+        else:
+            # 选择题处理
+            choices = extract_choices(block)
+            correct_content = ""
+
+            # 查找正确答案内容
+            for index, content in choices:
+                if index == correct_answer_key:
+                    correct_content = content
+                    break
+
+            # 生成文本格式
+            formatted_question = f"{i}.{question_text}...({correct_answer_key})"
+            text_results.append(formatted_question)
+
+            # 添加选项
+            for index, content in choices:
+                text_results.append(f"{index}.{content}")
+
+            # 确保有4个选项
+            while len(choices) < 4:
+                missing_index = chr(65 + len(choices))
+                text_results.append(f"{missing_index}.______")
+                choices.append((missing_index, "______"))
+
+            text_results.append(f"\n正确答案：{correct_content if correct_content else correct_answer_key}\n")
+
+            # 生成JSON格式
+            json_options = []
+            for _, content in choices:
+                json_options.append(content)
+
+            json_list.append({
+                'q': question_text,
+                'a': json_options,
+                'ans': correct_answer_key
+            })
+
+    if not text_results:
+        return "", []
+
+    return '\n'.join(text_results), json_list
+
+
+def main_gui():
+    root = tk.Tk()
+    root.title("优学院题库提取工具")
+    root.geometry("800x600")
+    root.resizable(True, True)
+
+    # 设置样式
+    style = ttk.Style()
+    style.configure("TLabel", font=("微软雅黑", 10))
+    style.configure("TButton", font=("微软雅黑", 10))
+    style.configure("TText", font=("微软雅黑", 10))
+
+    # 创建主框架
+    main_frame = ttk.Frame(root, padding="10")
+    main_frame.pack(fill=tk.BOTH, expand=True)
+
+    # 标题
+    title_label = ttk.Label(main_frame, text="优学院题库提取工具", font=("微软雅黑", 16, "bold"))
+    title_label.pack(pady=10)
+
+    # 输入文件选择
+    input_frame = ttk.LabelFrame(main_frame, text="输入设置", padding="10")
+    input_frame.pack(fill=tk.X, pady=5)
+
+    # 默认输入文件为代码同级目录下的"这里写题库HTML代码.txt"
+    default_input_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), "这里写题库HTML代码.txt")
+    input_var = tk.StringVar(value=default_input_file)
+    input_entry = ttk.Entry(input_frame, textvariable=input_var, width=60)
+    input_entry.pack(side=tk.LEFT, padx=5)
+
+    def browse_input():
+        filename = filedialog.askopenfilename(title="选择HTML文件",
+                                              filetypes=[("文本文件", "*.txt"), ("HTML文件", "*.html")])
+        if filename:
+            input_var.set(filename)
+
+    browse_btn = ttk.Button(input_frame, text="浏览", command=browse_input)
+    browse_btn.pack(side=tk.LEFT, padx=5)
+
+    # 输出目录设置
+    output_frame = ttk.LabelFrame(main_frame, text="输出设置", padding="10")
+    output_frame.pack(fill=tk.X, pady=5)
+
+    # 默认输出目录为代码同级目录下的"题库"文件夹
+    default_output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "题库")
+    output_var = tk.StringVar(value=default_output_dir)
+    output_entry = ttk.Entry(output_frame, textvariable=output_var, width=60)
+    output_entry.pack(side=tk.LEFT, padx=5)
+
+    def browse_output():
+        directory = filedialog.askdirectory(title="选择输出目录")
+        if directory:
+            output_var.set(directory)
+
+    browse_output_btn = ttk.Button(output_frame, text="浏览", command=browse_output)
+    browse_output_btn.pack(side=tk.LEFT, padx=5)
+
+    # 保存模式选择
+    mode_frame = ttk.LabelFrame(main_frame, text="保存模式", padding="10")
+    mode_frame.pack(fill=tk.X, pady=5)
+
+    mode_var = tk.StringVar(value="1")
+    ttk.Radiobutton(mode_frame, text="追加到现有文件", variable=mode_var, value="1").pack(side=tk.LEFT, padx=10)
+    ttk.Radiobutton(mode_frame, text="另添新文件", variable=mode_var, value="2").pack(side=tk.LEFT, padx=10)
+
+    # 日志输出
+    log_frame = ttk.LabelFrame(main_frame, text="执行日志", padding="10")
+    log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
+
+    log_text = tk.Text(log_frame, wrap=tk.WORD, height=15)
+    log_text.pack(fill=tk.BOTH, expand=True)
+    log_scroll = ttk.Scrollbar(log_text, command=log_text.yview)
+    log_scroll.pack(side=tk.RIGHT, fill=tk.Y)
+    log_text.config(yscrollcommand=log_scroll.set)
+
+    # 重定向print到文本框
+    class RedirectText:
+        def __init__(self, text_widget):
+            self.text_widget = text_widget
+
+        def write(self, string):
+            self.text_widget.insert(tk.END, string)
+            self.text_widget.see(tk.END)
+
+        def flush(self):
+            pass
+
+    sys.stdout = RedirectText(log_text)
+
+    # 执行按钮
+    def execute():
+        input_file = input_var.get()
+        output_dir = output_var.get()
+        mode = mode_var.get()
+
+        if not input_file:
+            messagebox.showerror("错误", "请选择输入文件")
+            return
+
+        if not os.path.exists(input_file):
+            messagebox.showerror("错误", f"找不到输入文件: {input_file}")
+            return
+
+        # 创建输出目录
+        if not os.path.exists(output_dir):
+            os.makedirs(output_dir)
+            print(f"[OK] 创建输出目录: {output_dir}")
+
+        # 读取HTML内容
+        print(f"[INFO] 正在读取文件: {input_file}")
+        try:
+            with open(input_file, 'r', encoding='utf-8') as f:
+                html_content = f.read()
+
+            if not html_content.strip():
+                print("[ERROR] 错误：输入文件为空")
+                return
+
+            print(f"[OK] 成功读取 {len(html_content)} 字符")
+
+        except UnicodeDecodeError:
+            print("[ERROR] 错误：文件编码错误，请使用UTF-8编码保存文件")
+            return
+        except Exception as e:
+            print(f"[ERROR] 读取文件时出错：{e}")
+            return
+
+        # 提取题目
+        print("[INFO] 正在提取题目...")
+        text_output, json_list = extract_questions(html_content)
+
+        if not text_output or not json_list:
+            print("[ERROR] 未提取到任何题目，请检查HTML格式")
+            return
+
+        # 选择保存模式
+        if mode == '2':
+            # 另添新文件模式
+            def get_new_filename(output_dir, base_name, extension):
+                counter = 1
+                while True:
+                    filename = os.path.join(output_dir, f"{base_name}{counter}.{extension}")
+                    if not os.path.exists(filename):
+                        return filename
+                    counter += 1
+                    if counter > 1000:
+                        timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        filename = os.path.join(output_dir, f"{base_name}_{timestamp}.{extension}")
+                        return filename
+
+            text_file = get_new_filename(output_dir, "题库", "txt")
+            json_file = get_new_filename(output_dir, "题库", "json")
+
+            # 写入文本格式结果
+            print(f"\n[INFO] 正在保存文本格式到新文件: {text_file}")
+            try:
+                with open(text_file, 'w', encoding='utf-8') as f:
+                    f.write(text_output)
+                print("[OK] 文本格式已保存")
+            except Exception as e:
+                print(f"[ERROR] 保存文本文件时出错：{e}")
+                return
+
+            # 写入JSON格式结果
+            print(f"[INFO] 正在保存JSON格式到新文件: {json_file}")
+            try:
+                with open(json_file, 'w', encoding='utf-8') as f:
+                    for item in json_list:
+                        json_str = json.dumps(item, ensure_ascii=False)
+                        f.write(json_str + '\n')
+                print("[OK] JSON格式已保存")
+            except Exception as e:
+                print(f"[ERROR] 保存JSON文件时出错：{e}")
+                return
+        else:
+            # 追加模式（默认）
+            def get_append_filename(output_dir, base_name, extension):
+                counter = 1
+                while True:
+                    filename = os.path.join(output_dir, f"{base_name}{counter}.{extension}")
+                    if os.path.exists(filename):
+                        return filename
+                    else:
+                        open(filename, 'w', encoding='utf-8').close()
+                        return filename
+                    counter += 1
+                    if counter > 1000:
+                        timestamp = time.strftime("%Y%m%d_%H%M%S")
+                        filename = os.path.join(output_dir, f"{base_name}_{timestamp}.{extension}")
+                        open(filename, 'w', encoding='utf-8').close()
+                        return filename
+
+            text_file = get_append_filename(output_dir, "题库", "txt")
+            json_file = get_append_filename(output_dir, "题库", "json")
+
+            # 追加保存文本格式结果
+            print(f"\n[INFO] 正在追加保存文本格式到: {text_file}")
+            try:
+                with open(text_file, 'a', encoding='utf-8') as f:
+                    if os.path.getsize(text_file) > 0:
+                        f.write('\n\n')
+                    f.write(text_output)
+                print("[OK] 文本格式已追加保存")
+            except Exception as e:
+                print(f"[ERROR] 保存文本文件时出错：{e}")
+                return
+
+            # 追加保存JSON格式结果
+            print(f"[INFO] 正在追加保存JSON格式到: {json_file}")
+
+            def save_json_append(json_list, output_path):
+                try:
+                    with open(output_path, 'a', encoding='utf-8') as f:
+                        if os.path.getsize(output_path) == 0:
+                            for item in json_list:
+                                json_str = json.dumps(item, ensure_ascii=False)
+                                f.write(json_str + '\n')
+                        else:
+                            f.write('\n')
+                            for item in json_list:
+                                json_str = json.dumps(item, ensure_ascii=False)
+                                f.write(json_str + '\n')
+                    return True
+                except Exception as e:
+                    print(f"[ERROR] 保存JSON文件时出错：{e}")
+                    return False
+
+            if save_json_append(json_list, json_file):
+                print("[OK] JSON格式已追加保存")
+            else:
+                print("[ERROR] 保存JSON文件失败")
+                return
+
+        # 统计信息
+        question_count = len(json_list)
+        print("-" * 60)
+        print("[INFO] 提取统计：")
+        print(f"  - 总题目数: {question_count}")
+        print(f"  - 输出目录: {os.path.abspath(output_dir)}")
+        print(f"  - 文本文件: {os.path.basename(text_file)}")
+        print(f"  - JSON文件: {os.path.basename(json_file)}")
+
+        # 显示预览
+        print(f"\n[INFO] 前2题预览（JSON格式）：")
+        print("-" * 60)
+        for i in range(min(2, len(json_list))):
+            item = json_list[i]
+            print(f"第{i + 1}题:")
+            print(f"题干(q): {item['q'][:50]}...")
+            print(f"选项(a): {item['a']}")
+            print(f"答案(ans): {item['ans']}")
+            if i < 1:
+                print()
+
+        print(f"\n[OK] 处理完成！")
+        messagebox.showinfo("成功", f"处理完成！共提取 {question_count} 道题目")
+
+    execute_btn = ttk.Button(main_frame, text="开始提取", command=execute)
+    execute_btn.pack(pady=10)
+
+    # 底部信息
+    info_label = ttk.Label(main_frame, text="优学院题库提取工具 - By 酱汁", font=("微软雅黑", 8))
+    info_label.pack(side=tk.BOTTOM, pady=5)
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main_gui()
